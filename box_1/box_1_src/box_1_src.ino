@@ -1,3 +1,11 @@
+#include <OSCBoards.h>
+#include <OSCBundle.h>
+#include <OSCData.h>
+#include <OSCMatch.h>
+#include <OSCMessage.h>
+#include <OSCTiming.h>
+#include <SLIPEncodedSerial.h>
+
 // Copyright (c) 2017 Electronic Theatre Controls, Inc., http://www.etcconnect.com
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -62,6 +70,8 @@
 
     2018-10-25   2.0.0.1  Richard Thompson       Add basic support for ColorSource
 
+    2024-11-22   2.1.0.0  Sam Davies.            Add paging support for Pan/Tilt & Edge/Zoom
+
  ******************************************************************************/
 
 /*******************************************************************************
@@ -91,7 +101,7 @@ SLIPEncodedSerial SLIPSerial(Serial);
 
 #define NEXT_BTN            6
 #define LAST_BTN            7
-#define SHIFT_BTN           8
+#define PAGE_BTN            8
 
 #define SUBSCRIBE           ((int32_t)1)
 #define UNSUBSCRIBE         ((int32_t)0)
@@ -103,15 +113,19 @@ SLIPEncodedSerial SLIPSerial(Serial);
 #define REVERSE             1
 
 // Change these values to switch which direction increase/decrease pan/tilt
-#define PAN_DIR             FORWARD
-#define TILT_DIR            FORWARD
+#define PAN_DIR             REVERSE
+#define TILT_DIR            REVERSE
+#define EDGE_DIR            REVERSE
+#define ZOOM_DIR            REVERSE
 
 // Use these values to make the encoder more coarse or fine.
 // This controls the number of wheel "ticks" the device sends to the console
 // for each tick of the encoder. 1 is the default and the most fine setting.
 // Must be an integer.
-#define PAN_SCALE           1
-#define TILT_SCALE          1
+#define PAN_SCALE           2
+#define TILT_SCALE          2
+#define EDGE_SCALE          1
+#define ZOOM_SCALE          1
 
 #define SIG_DIGITS          3   // Number of significant digits displayed
 
@@ -121,7 +135,7 @@ const String HANDSHAKE_QUERY = "ETCOSC?";
 const String HANDSHAKE_REPLY = "OK";
 
 //See displayScreen() below - limited to 10 chars (after 6 prefix chars)
-#define VERSION_STRING      "2.0.0.1"
+#define VERSION_STRING      "2.1.0.0"
 
 #define BOX_NAME_STRING     "box1"
 
@@ -135,8 +149,15 @@ const String HANDSHAKE_REPLY = "OK";
 /*******************************************************************************
    Local Types
  ******************************************************************************/
-enum WHEEL_TYPE { TILT, PAN };
+enum WHEEL_TYPE { PAN, TILT, EDGE, ZOOM };
 enum WHEEL_MODE { COARSE, FINE };
+enum PAGE_TYPE { PAN_TILT, EDGE_ZOOM };
+
+struct EncoderValue
+{
+  float pos;
+  uint8_t direction;
+};
 
 struct Encoder
 {
@@ -144,11 +165,11 @@ struct Encoder
   uint8_t pinB;
   int pinAPrevious;
   int pinBPrevious;
-  float pos;
-  uint8_t direction;
 };
-struct Encoder panWheel;
-struct Encoder tiltWheel;
+struct Encoder leftWheel;
+struct Encoder rightWheel;
+
+struct EncoderValue encoderValues[4];
 
 enum ConsoleType
 {
@@ -169,6 +190,7 @@ bool updateDisplay = false;
 ConsoleType connectedToConsole = ConsoleNone;
 unsigned long lastMessageRxTime = 0;
 bool timeoutPingSent = false;
+PAGE_TYPE currentPage = PAN_TILT;
 
 /*******************************************************************************
    Local Functions
@@ -205,6 +227,18 @@ void issueEosSubscribes()
   SLIPSerial.beginPacket();
   subTilt.send(SLIPSerial);
   SLIPSerial.endPacket();
+
+  OSCMessage subEdge("/eos/subscribe/param/edge");
+  subEdge.add(SUBSCRIBE);
+  SLIPSerial.beginPacket();
+  subEdge.send(SLIPSerial);
+  SLIPSerial.endPacket();
+
+  OSCMessage subZoom("/eos/subscribe/param/zoom");
+  subZoom.add(SUBSCRIBE);
+  SLIPSerial.beginPacket();
+  subZoom.send(SLIPSerial);
+  SLIPSerial.endPacket();
 }
 
 /*******************************************************************************
@@ -220,13 +254,25 @@ void issueEosSubscribes()
  ******************************************************************************/
 void parseFloatPanUpdate(OSCMessage& msg, int addressOffset)
 {
-  panWheel.pos = msg.getOSCData(0)->getFloat();
+  encoderValues[PAN].pos = msg.getOSCData(0)->getFloat();
   updateDisplay = true;
 }
 
 void parseFloatTiltUpdate(OSCMessage& msg, int addressOffset)
 {
-  tiltWheel.pos = msg.getOSCData(0)->getFloat();
+  encoderValues[TILT].pos = msg.getOSCData(0)->getFloat();
+  updateDisplay = true;
+}
+
+void parseFloatEdgeUpdate(OSCMessage& msg, int addressOffset)
+{
+  encoderValues[EDGE].pos = msg.getOSCData(0)->getFloat();
+  updateDisplay = true;
+}
+
+void parseFloatZoomUpdate(OSCMessage& msg, int addressOffset)
+{
+  encoderValues[ZOOM].pos = msg.getOSCData(0)->getFloat();
   updateDisplay = true;
 }
 
@@ -240,8 +286,10 @@ void parseEos(OSCMessage& msg, int addressOffset)
     updateDisplay = true;
   }
 
-  if (!msg.route("/out/param/pan", parseFloatPanUpdate, addressOffset))
-    msg.route("/out/param/tilt", parseFloatTiltUpdate, addressOffset);
+  msg.route("/out/param/pan", parseFloatPanUpdate, addressOffset);
+  msg.route("/out/param/tilt", parseFloatTiltUpdate, addressOffset);
+  msg.route("/out/param/edge", parseFloatEdgeUpdate, addressOffset);
+  msg.route("/out/param/zoom", parseFloatZoomUpdate, addressOffset);
 }
 
 /******************************************************************************/
@@ -329,15 +377,29 @@ void displayStatus()
 
     case ConsoleEos:
       {
-        // put the cursor at the begining of the first line
-        lcd.setCursor(0, 0);
-        lcd.print("Pan:  ");
-        lcd.print(panWheel.pos, SIG_DIGITS);
+        if (currentPage == PAN_TILT)
+        {
+          // put the cursor at the beginning of the first line
+          lcd.setCursor(0, 0);
+          lcd.print("Pan:  ");
+          lcd.print(encoderValues[PAN].pos, SIG_DIGITS);
 
-        // put the cursor at the begining of the second line
-        lcd.setCursor(0, 1);
-        lcd.print("Tilt: ");
-        lcd.print(tiltWheel.pos, SIG_DIGITS);
+          // put the cursor at the beginning of the second line
+          lcd.setCursor(0, 1);
+          lcd.print("Tilt: ");
+          lcd.print(encoderValues[TILT].pos, SIG_DIGITS);
+        } else {
+          // put the cursor at the beginning of the first line
+          lcd.setCursor(0, 0);
+          lcd.print("Edge: ");
+          lcd.print(encoderValues[EDGE].pos, SIG_DIGITS);
+
+          // put the cursor at the beginning of the second line
+          lcd.setCursor(0, 1);
+          lcd.print("Zoom: ");
+          lcd.print(encoderValues[ZOOM].pos, SIG_DIGITS);
+        }
+        
       } break;
 
     case ConsoleCobalt:
@@ -377,18 +439,33 @@ void displayStatus()
    Return Value: void
 
  ******************************************************************************/
-void initEncoder(struct Encoder* encoder, uint8_t pinA, uint8_t pinB, uint8_t direction)
+void initEncoder(struct Encoder* encoder, uint8_t pinA, uint8_t pinB)
 {
   encoder->pinA = pinA;
   encoder->pinB = pinB;
-  encoder->pos = 0;
-  encoder->direction = direction;
 
   pinMode(pinA, INPUT_PULLUP);
   pinMode(pinB, INPUT_PULLUP);
 
   encoder->pinAPrevious = digitalRead(pinA);
   encoder->pinBPrevious = digitalRead(pinB);
+}
+
+
+/*******************************************************************************
+   Initializes a given encoder value struct to the requested parameters.
+
+   Parameters:
+    encoderValue - Pointer to the encoder value we will be initializing
+    direction - Determines if clockwise or counterclockwise is "forward"
+
+   Return Value: void
+
+ ******************************************************************************/
+void initEncoderValue(struct EncoderValue* encoderValue, uint8_t direction)
+{
+  encoderValue->pos = 0.0;
+  encoderValue->direction = direction;
 }
 
 /*******************************************************************************
@@ -416,10 +493,6 @@ int8_t updateEncoder(struct Encoder* encoder)
   {
     // Since it has moved, we must determine if the encoder has moved forwards or backwards
     encoderMotion = (encoder->pinAPrevious == encoder->pinBPrevious) ? -1 : 1;
-
-    // If we are in reverse mode, flip the direction of the encoder motion
-    if (encoder->direction == REVERSE)
-      encoderMotion = -encoderMotion;
   }
   encoder->pinAPrevious = pinACurrent;
   encoder->pinBPrevious = pinBCurrent;
@@ -451,18 +524,25 @@ void sendEosWheelMove(WHEEL_TYPE type, float ticks)
 {
   String wheelMsg("/eos/wheel");
 
-  if (digitalRead(SHIFT_BTN) == LOW)
-    wheelMsg.concat("/fine");
-  else
-    wheelMsg.concat("/coarse");
+  wheelMsg.concat("/coarse");
 
-  if (type == PAN)
+  switch (type)
+  {
+  case PAN:
     wheelMsg.concat("/pan");
-  else if (type == TILT)
+    break;
+  case TILT:
     wheelMsg.concat("/tilt");
-  else
-    // something has gone very wrong
+    break;
+  case EDGE:
+    wheelMsg.concat("/edge");
+    break;
+  case ZOOM:
+    wheelMsg.concat("/zoom");
+    break;
+  default:
     return;
+  }
 
   sendOscMessage(wheelMsg, ticks);
 }
@@ -479,9 +559,6 @@ void sendCobaltWheelMove(WHEEL_TYPE type, float ticks)
     // something has gone very wrong
     return;
 
-  if (digitalRead(SHIFT_BTN) != LOW)
-    ticks = ticks * 16;
-
   sendOscMessage(wheelMsg, ticks);
 }
 
@@ -496,9 +573,6 @@ void sendColorSourceWheelMove(WHEEL_TYPE type, float ticks)
   else
     // something has gone very wrong
     return;
-
-  if (digitalRead(SHIFT_BTN) != LOW)
-    ticks = ticks * 2;
 
   sendOscMessage(wheelMsg, ticks);
 }
@@ -575,14 +649,14 @@ void sendKeyPress(bool down, const String &key)
 void checkButtons()
 {
   // OSC configuration
-  const int keyCount = 2;
-  const int keyPins[2] = {NEXT_BTN, LAST_BTN};
+  const int keyCount = 3;
+  const int keyPins[3] = {NEXT_BTN, LAST_BTN, PAGE_BTN};
   const String keyNames[4] = {
     "NEXT", "LAST",
     "soft6", "soft4"
   };
 
-  static int keyStates[2] = {HIGH, HIGH};
+  static int keyStates[3] = {HIGH, HIGH, HIGH};
 
   // Eos and Cobalt buttons are the same
   // ColorSource is different
@@ -597,12 +671,23 @@ void checkButtons()
       // Notify console of this key press
       if (keyStates[keyNum] == LOW)
       {
-        sendKeyPress(false, keyNames[firstKey + keyNum]);
+        if (keyPins[keyNum] == PAGE_BTN) {
+          // No-op when low. Only change page when button is pressed.
+          // currentPage = (currentPage == PAN_TILT) ? EDGE_ZOOM : PAN_TILT;
+          // updateDisplay = true;
+        } else {
+          sendKeyPress(false, keyNames[firstKey + keyNum]);
+        }
         keyStates[keyNum] = HIGH;
       }
       else
       {
-        sendKeyPress(true, keyNames[firstKey + keyNum]);
+        if (keyPins[keyNum] == PAGE_BTN) {
+          currentPage = (currentPage == PAN_TILT) ? EDGE_ZOOM : PAN_TILT;
+          updateDisplay = true;
+        } else {
+          sendKeyPress(false, keyNames[firstKey + keyNum]);
+        }
         keyStates[keyNum] = LOW;
       }
     }
@@ -644,15 +729,20 @@ void setup()
   // If it's an Eos, request updates on some things
   issueEosSubscribes();
 
-  initEncoder(&panWheel, A0, A1, PAN_DIR);
-  initEncoder(&tiltWheel, A3, A4, TILT_DIR);
+  initEncoder(&leftWheel, A0, A1);
+  initEncoder(&rightWheel, A3, A4);
+
+  initEncoderValue(&encoderValues[PAN], PAN_DIR);
+  initEncoderValue(&encoderValues[TILT], TILT_DIR);
+  initEncoderValue(&encoderValues[EDGE], EDGE_DIR);
+  initEncoderValue(&encoderValues[ZOOM], ZOOM_DIR);
 
   lcd.begin(LCD_CHARS, LCD_LINES);
   lcd.clear();
 
   pinMode(NEXT_BTN, INPUT_PULLUP);
   pinMode(LAST_BTN, INPUT_PULLUP);
-  pinMode(SHIFT_BTN, INPUT_PULLUP);
+  pinMode(PAGE_BTN, INPUT_PULLUP);
 
   displayStatus();
 }
@@ -676,12 +766,44 @@ void loop()
   static String curMsg;
   int size;
   // get the updated state of each encoder
-  int32_t panMotion = updateEncoder(&panWheel);
-  int32_t tiltMotion = updateEncoder(&tiltWheel);
+  int32_t leftMotion = updateEncoder(&leftWheel);
+  int32_t rightMotion = updateEncoder(&rightWheel);
 
-  // Scale the result by a scaling factor
-  panMotion *= PAN_SCALE;
-  tiltMotion *= TILT_SCALE;
+  int32_t panMotion = 0;
+  int32_t tiltMotion = 0;
+  int32_t edgeMotion = 0;
+  int32_t zoomMotion = 0;
+
+  // Faff around with the right page
+  if (currentPage == PAN_TILT)
+  {
+    // Get the values from the encoders
+    panMotion = leftMotion;
+    tiltMotion = rightMotion;
+
+    // Check for reverse direction
+    if (encoderValues[PAN].direction == REVERSE)
+      panMotion *= -1;
+    if (encoderValues[TILT].direction == REVERSE)
+      tiltMotion *= -1;
+
+    // Scale the result by a scaling factor
+    panMotion *= PAN_SCALE;
+    tiltMotion *= TILT_SCALE;
+  } else {
+    // Get the values from the encoders
+    edgeMotion = leftMotion;
+    zoomMotion = rightMotion;
+
+    // Check for reverse direction
+    if (encoderValues[EDGE].direction == REVERSE)
+      edgeMotion *= -1;
+    if (encoderValues[ZOOM].direction == REVERSE)
+      zoomMotion *= -1;
+    // Scale the result by a scaling factor
+    edgeMotion *= EDGE_SCALE;
+    zoomMotion *= ZOOM_SCALE;
+  }
 
   // check for next/last updates
   checkButtons();
@@ -692,6 +814,12 @@ void loop()
 
   if (panMotion != 0)
     sendWheelMove(PAN, panMotion);
+
+  if (edgeMotion != 0)
+    sendWheelMove(EDGE, edgeMotion);
+
+  if (zoomMotion != 0)
+    sendWheelMove(ZOOM, zoomMotion);
 
   // Then we check to see if any OSC commands have come from Eos
   // and update the display accordingly.
